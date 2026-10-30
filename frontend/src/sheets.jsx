@@ -33,7 +33,7 @@ import BodyMap from './components/BodyMap.jsx'
 import MuscleExplorer from './components/MuscleExplorer.jsx'
 import ExerciseViewToggle from './components/ExerciseViewToggle.jsx'
 import { sameMuscleFirst, swapMuscleOf } from './lib/similar-exercises.js'
-import { exerciseMuscleSnapshot, loadOfWorkouts, MUSCLES, MUSCLE_NAME, muscleWeightsOf, muscleGroupsOf, hasExplicitMuscleMetadata, inMuscleOrder } from './lib/muscles.js'
+import { exerciseMuscleSnapshot, loadOfWorkouts, MUSCLES, MUSCLE_NAME, muscleWeightsOf, muscleGroupsOf, hasExplicitMuscleMetadata, inMuscleOrder, canonicalMuscle } from './lib/muscles.js'
 import { parseImport, mergeImport } from './lib/import-csv.js'
 import { importHevyData, HevyApiError, HEVY_DEV_SETTINGS, mergeHevyRoutines, hevySummaryCounts } from './lib/import-hevy.js'
 import { buildPlanBundle, parsePlan, mergePlan, printPlan, planPrintHTML } from './lib/plan-share.js'
@@ -1100,28 +1100,75 @@ function OneRM({ ex }) {
 
 // A muscle the catalogue credits with nothing (a bench press's biceps, #359) is not one it trains,
 // so it is not shown as a tag either; "By muscle" already leaves the exercise out.
-const trainedBy = ex => { const weights = muscleWeightsOf(ex); return slug => weights[slug] !== 0 }
+const trainedBy = ex => {
+  const weights = muscleWeightsOf(ex)
+  return name => {
+    const slug = canonicalMuscle(name)
+    return slug != null && (weights[slug] || 0) !== 0
+  }
+}
 // The detail page's tags: body part, main muscles, equipment, then up to three helpers. A word
 // says once what it says: the body part "Chest" and the main muscle "Chest" of a bench press
 // were two tags (QA 10-06), and a helper never repeats a main muscle.
+// Each involved muscle's share of the exercise's total stimulus: the weights are
+// normalised so the involved muscles add up to 100 %.
 export function detailTags(ex) {
+  const weights = muscleWeightsOf(ex)
+  const total = Object.values(weights).reduce((sum, w) => sum + ((w || 0) > 0 ? (w || 0) : 0), 0)
+  const pctOf = slug => total > 0 ? Math.round(((weights[slug] || 0) / total * 100)) + '%' : '0%'
   const seen = new Set()
   const out = []
-  const add = (label, extra) => {
-    const k = String(label || '').trim().toLocaleLowerCase()
+  // `key` lets a label that carries extra text (a percentage) still dedupe on the
+  // underlying word, so "Chest 100 %" and "Chest 40 %" never both appear.
+  const add = (label, extra, key) => {
+    const k = String(key != null ? key : label || '').trim().toLocaleLowerCase()
     if (!k || seen.has(k)) return false
     seen.add(k)
     out.push({ key: out.length, label, ...extra })
     return true
   }
-  add(t(ex.bp), { acc: true })
-  if (ex.bp === 'cardio') add(t(MUSCLE_NAME['cardiovascular system']), { icon: 'figureStrength' })
-  else for (const s of (ex.primaries?.length ? ex.primaries : (ex.tg ? [ex.tg] : [])).filter(trainedBy(ex))) add(t(MUSCLE_NAME[s] || s), { icon: 'figureStrength' })
+  // A body part that is also a (possibly aliased) muscle carries that muscle's percentage,
+  // so the primary is not printed twice.
+  const bpSlug = canonicalMuscle(ex.bp)
+  // Only fold the percentage into the body-part tag when it would otherwise be printed
+  // twice (same word, like "Chest"/"Chest"). Otherwise the muscle tag keeps it.
+  const sameWord = bpSlug != null && t(ex.bp).trim().toLocaleLowerCase() === t(MUSCLE_NAME[bpSlug] || bpSlug).trim().toLocaleLowerCase()
+  const bpPct = sameWord && bpSlug && (weights[bpSlug] || 0) !== 0 ? ' ' + pctOf(bpSlug) : ''
+  add(t(ex.bp) + bpPct, { acc: true }, t(ex.bp))
+  if (ex.bp === 'cardio') {
+    const cardioPct = (weights['cardiovascular system'] || 0) !== 0 ? ' ' + pctOf('cardiovascular system') : ''
+    add(t(MUSCLE_NAME['cardiovascular system']) + cardioPct, { icon: 'figureStrength' }, t(MUSCLE_NAME['cardiovascular system']))
+  }
+  for (const s of (ex.primaries?.length ? ex.primaries : (ex.tg ? [ex.tg] : [])).filter(trainedBy(ex))) {
+    const slug = canonicalMuscle(s)
+    if (!slug) continue
+    add(t(MUSCLE_NAME[slug] || slug) + ' ' + pctOf(slug), { icon: 'figureStrength' }, t(MUSCLE_NAME[slug] || slug))
+  }
   add(t(ex.eq), { icon: 'kettlebell' })
-  let helpers = 0
+  // Secondary muscles: at most three tags in total, "Other" included. So when there are
+  // more than three distinct helpers, two are shown individually and the rest are folded
+  // into "Other" (whose percentage is their combined share).
+  const secondarySlugs = []
+  const seenSecondary = new Set()
   for (const s of (ex.secondaries?.length ? ex.secondaries : smOf(ex)).filter(trainedBy(ex))) {
-    if (helpers >= 3) break
-    if (add(t(MUSCLE_NAME[s] || s))) helpers++
+    const slug = canonicalMuscle(s)
+    if (!slug) continue
+    const label = t(MUSCLE_NAME[slug] || slug)
+    if (seen.has(label.toLocaleLowerCase()) || seenSecondary.has(label.toLocaleLowerCase())) continue
+    seenSecondary.add(label.toLocaleLowerCase())
+    secondarySlugs.push({ slug, label })
+  }
+  const hasOther = secondarySlugs.length > 3
+  const shownSecondaries = hasOther ? secondarySlugs.slice(0, 2) : secondarySlugs.slice(0, 3)
+  const omitted = hasOther ? secondarySlugs.slice(2) : []
+  let otherWeight = 0
+  for (const { slug } of omitted) otherWeight += (weights[slug] || 0)
+  for (const { slug, label } of shownSecondaries) {
+    add(label + ' ' + pctOf(slug), undefined, label)
+  }
+  if (hasOther && otherWeight > 0 && total > 0) {
+    const otherPct = Math.round(otherWeight / total * 100)
+    if (otherPct > 0) add(t('Other') + ' ' + otherPct + '%', { other: omitted.map(({ slug, label }) => ({ slug, label, pct: pctOf(slug) })) })
   }
   return out
 }
@@ -1132,6 +1179,7 @@ function ExerciseDetail({ ex, close }) {
   const last = lastEntryFor(st, ex.id)
   const best = bestWeightFor(st, ex.id, currentDbLoad(st, ex.id))
   const fav = isFav(st, ex.id)
+  const [showOther, setShowOther] = useState(false)
   const flipFav = () => {
     let on = false
     update(s => { on = toggleFav(s, ex.id) })
@@ -1147,8 +1195,16 @@ function ExerciseDetail({ ex, close }) {
     </div>
     <Media ex={ex} />
     <div className="row" style={{ gap: 6, flexWrap: 'wrap', margin: '10px 0' }}>
-      {detailTags(ex).map(tg => <span key={tg.key} className={'tag' + (tg.acc ? ' acc' : '')}>{tg.icon && <Icon name={tg.icon} />}{tg.label}</span>)}
+      {detailTags(ex).map(tg => tg.other
+        ? <button key={tg.key} type="button" className="tag" onClick={() => setShowOther(v => !v)} aria-expanded={showOther}>{tg.label}</button>
+        : <span key={tg.key} className={'tag' + (tg.acc ? ' acc' : '')}>{tg.icon && <Icon name={tg.icon} />}{tg.label}</span>)}
     </div>
+    {showOther && (() => {
+      const other = detailTags(ex).find(tg => tg.other)?.other || []
+      return <div className="row" style={{ gap: 6, flexWrap: 'wrap', margin: '0 0 10px' }}>
+        {other.map((m, i) => <span key={i} className="tag dim">{m.label} {m.pct}</span>)}
+      </div>
+    })()}
     <ExerciseAliasesEditor key={ex.id} ex={ex} />
     {descFor(ex) && <div className="exnote">{descFor(ex)}</div>}
     {best > 0 && <div className="small row" style={{ marginBottom: 6, gap: 5 }}><Icon name="trophy" style={{ fontSize: 14, color: 'var(--yellow)' }} />{t('Best:')} <b className="accent" style={{ whiteSpace: 'nowrap' }}>{fmtNum(best)} {st.unit}</b>{last ? ` · ${t('last')} ${fmtDate(last.d)}: ${last.sets.map(s => setLabel(ex.id, s, last.target, speedUnitOf(st))).join(', ')}` : ''}</div>}
